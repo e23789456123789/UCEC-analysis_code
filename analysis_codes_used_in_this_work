@@ -1,40 +1,7 @@
-import os
-import json
-import logging
-import warnings
-import random  
-import numpy as np
-import pandas as pd
-import joblib
-import optuna
-from optuna.samplers import TPESampler  
-import matplotlib.pyplot as plt
-import seaborn as sns
-from scipy.stats import ttest_ind
-from statsmodels.stats.multitest import multipletests 
-from statsmodels.stats.proportion import proportion_confint 
-from sklearn.base import BaseEstimator, TransformerMixin, clone
-from sklearn.model_selection import StratifiedKFold, cross_val_score, cross_val_predict 
-from sklearn.metrics import (roc_auc_score, classification_report, confusion_matrix, 
-                             roc_curve, precision_recall_curve, average_precision_score, f1_score)
-from sklearn.calibration import calibration_curve 
-from sklearn.linear_model import LogisticRegression
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
-from xgboost import XGBClassifier
-from lightgbm import LGBMClassifier
-from sklearn.ensemble import RandomForestClassifier
-
 warnings.filterwarnings('ignore')
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("VisualizedMultiModalPipeline")
-
-SEED = 56
-random.seed(SEED)
-np.random.seed(SEED)
-OPTUNA_TRIALS = 30    
-BOOTSTRAP_ITERS = 1000  
 
 plt.rcParams['font.sans-serif'] = ['Arial', 'Liberation Sans', 'DejaVu Sans']
 plt.rcParams['axes.unicode_minus'] = False
@@ -94,17 +61,22 @@ class PipelineBatchCorrector(BaseEstimator, TransformerMixin):
                 b_mean = self.means_[batch_id]
                 b_std = self.stds_[batch_id]
             else:
-                b_mean = self.fallback_mean_
-                b_std = self.fallback_std_
+                if len(group) > 1:
+                    b_mean = group[self.feature_cols_].mean()
+                    b_std = group[self.feature_cols_].std().replace(0, 1e-8)
+                else:
+                    b_mean = self.fallback_mean_
+                    b_std = self.fallback_std_
                 
             X_trans.loc[idx, self.feature_cols_] = (X.loc[idx, self.feature_cols_] - b_mean) / b_std
             
         return X_trans.drop(columns=[self.batch_col])
 
 class PipelineStrictFeatureSelector(BaseEstimator, TransformerMixin):
-    def __init__(self, fdr_alpha=0.05, top_n_fallback=100):
+    def __init__(self, fdr_alpha=0.05, top_n_fallback=100, l1_C=0.5):
         self.fdr_alpha = fdr_alpha
         self.top_n_fallback = top_n_fallback
+        self.l1_C = l1_C
         self.selected_features_idx_ = None
         
     def fit(self, X, y):
@@ -117,10 +89,15 @@ class PipelineStrictFeatureSelector(BaseEstimator, TransformerMixin):
         t_vals = X_arr[tumor_mask, :]
         n_vals = X_arr[normal_mask, :]
         
+        p_values = np.zeros(X_arr.shape[1])
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            _, p_values = ttest_ind(t_vals, n_vals, axis=0, equal_var=False, nan_policy='omit')
-            
+            for i in range(X_arr.shape[1]):
+                try:
+                    _, p_values[i] = mannwhitneyu(t_vals[:, i], n_vals[:, i], nan_policy='omit')
+                except ValueError:
+                    p_values[i] = np.nan
+                    
         valid_mask = ~np.isnan(p_values)
         valid_indices = np.where(valid_mask)[0]
         valid_p_values = p_values[valid_mask]
@@ -140,7 +117,7 @@ class PipelineStrictFeatureSelector(BaseEstimator, TransformerMixin):
         X_passed_scaled = StandardScaler().fit_transform(X_passed)
         
         lr = LogisticRegression(
-            penalty="l1", solver="liblinear", C=0.5, 
+            penalty="l1", solver="liblinear", C=self.l1_C, 
             class_weight="balanced", random_state=SEED, max_iter=500
         )
         lr.fit(X_passed_scaled, y_arr)
@@ -160,7 +137,7 @@ class PipelineStrictFeatureSelector(BaseEstimator, TransformerMixin):
         return X_arr[:, self.selected_features_idx_]
 
 def clean_and_align_all_matrices():
-    df_ref = pd.read_csv("5.fragma_matrix_zscore.csv").drop_duplicates(subset=["Sample_ID"])
+    df_ref = pd.read_csv(".csv").drop_duplicates(subset=["Sample_ID"])
     core_samples = set(df_ref["Sample_ID"].tolist())
     
     group_map = {}
@@ -180,20 +157,20 @@ def clean_and_align_all_matrices():
     split_map.update({s: "Test" for s in test_samples})
     
     cleaned_files_registry = {}
-    if os.path.exists("1.6bp_breakpoint_motif_matrix.tsv"):
-        cleaned_files_registry["matrix_6bp.csv"] = pd.read_csv("1.6bp_breakpoint_motif_matrix.tsv", sep='\t', index_col=0).T.reset_index().rename(columns={"index": "Sample_ID"})
-    if os.path.exists("2.df_ratio_per_5mb-UCEC.csv"):
-        cleaned_files_registry["matrix_5mb.csv"] = pd.read_csv("2.df_ratio_per_5mb-UCEC.csv").rename(columns={"id": "Sample_ID"}).drop(columns=["type"], errors="ignore")
-    if os.path.exists("3.Dat_GT__sample-4bp.csv"):
-        cleaned_files_registry["matrix_4bp.csv"] = pd.read_csv("3.Dat_GT__sample-4bp.csv").rename(columns={"WhichSample": "Sample_ID"}).drop(columns=["WhichGroup"], errors="ignore")
-    if os.path.exists("4.Dat_GT__sample-3bp.csv"):
-        cleaned_files_registry["matrix_3bp.csv"] = pd.read_csv("4.Dat_GT__sample-3bp.csv").rename(columns={"WhichSample": "Sample_ID"}).drop(columns=["WhichGroup"], errors="ignore")
-    if os.path.exists("5.fragma_matrix_zscore.csv"):
-        cleaned_files_registry["matrix_fragma.csv"] = pd.read_csv("5.fragma_matrix_zscore.csv").drop(columns=["Sample Type"], errors="ignore")
-    if os.path.exists("6.amplitude.csv") and os.path.exists("6.mean_coverage.csv") and os.path.exists("6.central_coverage.csv"):
-        df_amp = pd.read_csv("6.amplitude.csv").rename(columns={"Unnamed: 0": "Sample_ID"}).drop(columns=["Type"], errors="ignore")
-        df_mean = pd.read_csv("6.mean_coverage.csv").rename(columns={"Unnamed: 0": "Sample_ID"}).drop(columns=["Type"], errors="ignore")
-        df_cent = pd.read_csv("6.central_coverage.csv").rename(columns={"Unnamed: 0": "Sample_ID"}).drop(columns=["Type"], errors="ignore")
+    if os.path.exists(".tsv"):
+        cleaned_files_registry[".csv"] = pd.read_csv(".tsv", sep='\t', index_col=0).T.reset_index().rename(columns={"index": "Sample_ID"})
+    if os.path.exists(".csv"):
+        cleaned_files_registry[".csv"] = pd.read_csv(".csv").rename(columns={"id": "Sample_ID"}).drop(columns=["type"], errors="ignore")
+    if os.path.exists(".csv"):
+        cleaned_files_registry[".csv"] = pd.read_csv(".csv").rename(columns={"WhichSample": "Sample_ID"}).drop(columns=["WhichGroup"], errors="ignore")
+    if os.path.exists(".csv"):
+        cleaned_files_registry[".csv"] = pd.read_csv(".csv").rename(columns={"WhichSample": "Sample_ID"}).drop(columns=["WhichGroup"], errors="ignore")
+    if os.path.exists(".csv"):
+        cleaned_files_registry[".csv"] = pd.read_csv(".csv").drop(columns=["Sample Type"], errors="ignore")
+    if os.path.exists(".csv") and os.path.exists(".csv") and os.path.exists(".csv"):
+        df_amp = pd.read_csv(".csv").rename(columns={"Unnamed: 0": "Sample_ID"}).drop(columns=["Type"], errors="ignore")
+        df_mean = pd.read_csv(".csv").rename(columns={"Unnamed: 0": "Sample_ID"}).drop(columns=["Type"], errors="ignore")
+        df_cent = pd.read_csv(".csv").rename(columns={"Unnamed: 0": "Sample_ID"}).drop(columns=["Type"], errors="ignore")
         for col in df_amp.columns:
             if col != "Sample_ID": df_amp = df_amp.rename(columns={col: f"Griffin_Amp_{col}"})
         for col in df_mean.columns:
@@ -223,24 +200,14 @@ def clean_and_align_all_matrices():
         
     return aligned_output_paths
 
-def calculate_metric_ci(y_true, y_pred, y_proba, metric_type="auc", n_bootstrap=BOOTSTRAP_ITERS):
+def calculate_metric_ci(y_true, y_pred, y_proba, metric_type="auc"):
     y_true = np.asarray(y_true)
     y_pred = np.asarray(y_pred)
     y_proba = np.asarray(y_proba)
     
     if metric_type == "auc":
         auc_val = roc_auc_score(y_true, y_proba)
-        bootstrapped_aucs = []
-        rng = np.random.default_rng(SEED)
-        for _ in range(n_bootstrap):
-            boot_idx = rng.integers(0, len(y_true), len(y_true))
-            if len(np.unique(y_true[boot_idx])) < 2:
-                continue
-            bootstrapped_aucs.append(roc_auc_score(y_true[boot_idx], y_proba[boot_idx]))
-        sorted_aucs = np.sort(bootstrapped_aucs)
-        lower = sorted_aucs[int(0.025 * len(sorted_aucs))]
-        upper = sorted_aucs[int(0.975 * len(sorted_aucs))]
-        return auc_val, lower, upper
+        return auc_val, np.nan, np.nan
         
     cm = confusion_matrix(y_true, y_pred)
     tn, fp, fn, tp = cm.ravel()
@@ -286,7 +253,7 @@ def plot_and_save_visualizations(df_train, chosen_features, y_test, y_proba, y_p
         
     fig, axes = plt.subplots(2, 2, figsize=(14, 13))
     
-    auc_v, auc_l, auc_u = calculate_metric_ci(y_test, y_pred, y_proba, "auc")
+    auc_v, _, _ = calculate_metric_ci(y_test, y_pred, y_proba, "auc")
     sens_v, sens_l, sens_u = calculate_metric_ci(y_test, y_pred, y_proba, "sensitivity")
     spec_v, spec_l, spec_u = calculate_metric_ci(y_test, y_pred, y_proba, "specificity")
     ppv_v, ppv_l, ppv_u = calculate_metric_ci(y_test, y_pred, y_proba, "ppv")
@@ -307,7 +274,7 @@ def plot_and_save_visualizations(df_train, chosen_features, y_test, y_proba, y_p
     axes[0, 0].legend(loc="lower right", frameon=True, fontsize=10)
     
     stats_box = (
-        f"Bootstrap AUC: {auc_v:.4f} (95% CI: {auc_l:.4f}-{auc_u:.4f})\n"
+        f"AUC: {auc_v:.4f}\n"
         f"Sensitivity: {sens_v:.4f} (95% CI: {sens_l:.4f}-{sens_u:.4f})\n"
         f"Specificity: {spec_v:.4f} (95% CI: {spec_l:.4f}-{spec_u:.4f})\n"
         f"PPV: {ppv_v:.4f} (95% CI: {ppv_l:.4f}-{ppv_u:.4f})\n"
@@ -350,7 +317,11 @@ def plot_and_save_visualizations(df_train, chosen_features, y_test, y_proba, y_p
     plt.close('all')
 
 def create_pipeline_space(model_name, trial):
-    space = {}
+    space = {
+        "selector__l1_C": trial.suggest_float("selector__l1_C", 0.05, 5.0, log=True),
+        "selector__fdr_alpha": trial.suggest_categorical("selector__fdr_alpha", [0.01, 0.05, 0.1])
+    }
+    
     if model_name == "xgboost":
         space.update({
             "clf__n_estimators": trial.suggest_int("clf__n_estimators", 50, 300),
@@ -363,7 +334,7 @@ def create_pipeline_space(model_name, trial):
             "clf__n_estimators": trial.suggest_int("clf__n_estimators", 50, 300),
             "clf__max_depth": trial.suggest_int("clf__max_depth", 3, 8),
             "clf__learning_rate": trial.suggest_float("clf__learning_rate", 0.01, 0.2),
-            "clf__num_leaves": trial.suggest_int("clf__num_leaves", 15, 31),
+            "clf__num_leaves": trial.suggest_int("clf__num_leaves", 15, 127), 
         })
     elif model_name == "randomforest":
         space.update({
@@ -400,7 +371,7 @@ def run_optuna_for_file(file_path, output_base_dir):
     def get_base_pipeline(m_name, scale_pos_weight=1.0):
         imputer = DataFrameImputer(ignore_cols=['Batch'])
         batch_corrector = PipelineBatchCorrector(batch_col='Batch')
-        selector = PipelineStrictFeatureSelector(fdr_alpha=0.05, top_n_fallback=100)
+        selector = PipelineStrictFeatureSelector(fdr_alpha=0.05, top_n_fallback=100, l1_C=0.5)
         if m_name == "xgboost":
             return Pipeline([('imputer', imputer), ('batch_corrector', batch_corrector), ('selector', selector), ('clf', XGBClassifier(scale_pos_weight=scale_pos_weight, eval_metric="logloss", verbosity=0, random_state=SEED, n_jobs=1))])
         elif m_name == "lightgbm":
@@ -476,8 +447,8 @@ def run_optuna_for_file(file_path, output_base_dir):
     with open(os.path.join(out_dir, "all_models_best_params.json"), "w") as f:
         json.dump(output_config, f, indent=4)
         
-    pd.DataFrame(classification_report(y_test, y_pred, output_dict=True)).to_csv(os.path.join(out_dir, "test_classification_report.csv"))
-    pd.DataFrame(confusion_matrix(y_test, y_pred)).to_csv(os.path.join(out_dir, "test_confusion_matrix.csv"))
+    pd.DataFrame(classification_report(y_test, y_pred, output_dict=True)).to_csv(os.path.join(out_dir, ".csv"))
+    pd.DataFrame(confusion_matrix(y_test, y_pred)).to_csv(os.path.join(out_dir, ".csv"))
     
     final_pipeline.selected_features_ = final_chosen_features
     final_pipeline.optimized_threshold_ = best_threshold
@@ -486,7 +457,7 @@ def run_optuna_for_file(file_path, output_base_dir):
     return {"file": file_name, "best_model": best_model_name, "valid_auc": best_cv_auc, "test_auc": test_auc}
 
 if __name__ == "__main__":
-    OUTPUT_BASE = "optuna_results_step1_73split"
+    OUTPUT_BASE = "."
     os.makedirs(OUTPUT_BASE, exist_ok=True)
     
     aligned_files = clean_and_align_all_matrices()
