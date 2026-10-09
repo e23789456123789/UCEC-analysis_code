@@ -62,8 +62,8 @@ class PipelineBatchCorrector(BaseEstimator, TransformerMixin):
                 b_std = self.stds_[batch_id]
             else:
                 if len(group) > 1:
-                    b_mean = group[self.feature_cols_].mean()
-                    b_std = group[self.feature_cols_].std().replace(0, 1e-8)
+                    b_mean = self.fallback_mean_
+                    b_std = self.fallback_std_
                 else:
                     b_mean = self.fallback_mean_
                     b_std = self.fallback_std_
