@@ -1,22 +1,52 @@
+import os
+import json
+import logging
+import warnings
+import random  
+import numpy as np
+import pandas as pd
+import joblib
+import optuna
+from optuna.samplers import TPESampler  
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy.stats import mannwhitneyu
+from statsmodels.stats.multitest import multipletests 
+from statsmodels.stats.proportion import proportion_confint 
+from sklearn.base import BaseEstimator, TransformerMixin, clone
+from sklearn.model_selection import StratifiedKFold, cross_val_score, cross_val_predict, train_test_split
+from sklearn.metrics import (roc_auc_score, classification_report, confusion_matrix, 
+                             roc_curve, precision_recall_curve, average_precision_score, f1_score)
+from sklearn.calibration import calibration_curve 
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from xgboost import XGBClassifier
+from lightgbm import LGBMClassifier
+from sklearn.ensemble import RandomForestClassifier
+
 warnings.filterwarnings('ignore')
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("VisualizedMultiModalPipeline")
+
+SEED = 56
+random.seed(SEED)
+np.random.seed(SEED)
+OPTUNA_TRIALS = 30    
 
 plt.rcParams['font.sans-serif'] = ['Arial', 'Liberation Sans', 'DejaVu Sans']
 plt.rcParams['axes.unicode_minus'] = False
 plt.style.use('seaborn-v0_8-whitegrid' if 'seaborn-v0_8-whitegrid' in plt.style.available else 'default')
 
 class DataFrameImputer(BaseEstimator, TransformerMixin):
-    def __init__(self, ignore_cols=['Batch']):
-        self.ignore_cols = ignore_cols
+    def __init__(self):
         self.means_ = {}
         
     def fit(self, X, y=None):
         if not isinstance(X, pd.DataFrame):
             X = pd.DataFrame(X)
-        numeric_cols = [c for c in X.columns if c not in self.ignore_cols]
-        self.means_ = X[numeric_cols].mean().to_dict()
+        self.means_ = X.mean().to_dict()
         return self
         
     def transform(self, X):
@@ -27,50 +57,6 @@ class DataFrameImputer(BaseEstimator, TransformerMixin):
             if col in X_trans.columns and X_trans[col].isnull().any():
                 X_trans[col] = X_trans[col].fillna(mean_val)
         return X_trans
-
-class PipelineBatchCorrector(BaseEstimator, TransformerMixin):
-    def __init__(self, batch_col='Batch'):
-        self.batch_col = batch_col
-        self.means_ = {}
-        self.stds_ = {}
-        self.fallback_mean_ = None
-        self.fallback_std_ = None
-        self.feature_cols_ = None
-        
-    def fit(self, X, y=None):
-        if not isinstance(X, pd.DataFrame):
-            X = pd.DataFrame(X)
-        self.feature_cols_ = [c for c in X.columns if c != self.batch_col]
-        
-        self.fallback_mean_ = X[self.feature_cols_].mean()
-        self.fallback_std_ = X[self.feature_cols_].std().replace(0, 1e-8)
-        
-        for batch_id, group in X.groupby(self.batch_col):
-            self.means_[batch_id] = group[self.feature_cols_].mean()
-            self.stds_[batch_id] = group[self.feature_cols_].std().replace(0, 1e-8)
-        return self
-        
-    def transform(self, X):
-        if not isinstance(X, pd.DataFrame):
-            X = pd.DataFrame(X)
-        X_trans = X.copy()
-        
-        for batch_id, group in X.groupby(self.batch_col):
-            idx = group.index
-            if batch_id in self.means_:
-                b_mean = self.means_[batch_id]
-                b_std = self.stds_[batch_id]
-            else:
-                if len(group) > 1:
-                    b_mean = self.fallback_mean_
-                    b_std = self.fallback_std_
-                else:
-                    b_mean = self.fallback_mean_
-                    b_std = self.fallback_std_
-                
-            X_trans.loc[idx, self.feature_cols_] = (X.loc[idx, self.feature_cols_] - b_mean) / b_std
-            
-        return X_trans.drop(columns=[self.batch_col])
 
 class PipelineStrictFeatureSelector(BaseEstimator, TransformerMixin):
     def __init__(self, fdr_alpha=0.05, top_n_fallback=100, l1_C=0.5):
@@ -141,20 +127,18 @@ def clean_and_align_all_matrices():
     core_samples = set(df_ref["Sample_ID"].tolist())
     
     group_map = {}
-    batch_map = {}
     for _, row in df_ref.iterrows():
         s_id = row["Sample_ID"]
         val_lower = str(row["Sample Type"]).lower().strip()
         group_map[s_id] = "Tumor" if val_lower in ["tumor", "cancer", "case"] else "Normal"
-        batch_map[s_id] = "Batch_ZG" if str(s_id).startswith("ZG") else "Batch_CGP_PGD"
     
     sample_list = sorted(list(core_samples))
     
-    train_samples = [s for s in sample_list if batch_map[s] == "Batch_ZG"]
-    test_samples = [s for s in sample_list if batch_map[s] == "Batch_CGP_PGD"]
+    df_samples = pd.DataFrame([{"Sample_ID": s, "Group": group_map[s]} for s in sample_list])
+    train_df, test_df = train_test_split(df_samples, test_size=0.3, stratify=df_samples["Group"], random_state=SEED)
     
-    split_map = {s: "Train" for s in train_samples}
-    split_map.update({s: "Test" for s in test_samples})
+    split_map = {row["Sample_ID"]: "Train" for _, row in train_df.iterrows()}
+    split_map.update({row["Sample_ID"]: "Test" for _, row in test_df.iterrows()})
     
     cleaned_files_registry = {}
     if os.path.exists(".tsv"):
@@ -177,7 +161,7 @@ def clean_and_align_all_matrices():
             if col != "Sample_ID": df_mean = df_mean.rename(columns={col: f"Griffin_Mean_{col}"})
         for col in df_cent.columns:
             if col != "Sample_ID": df_cent = df_cent.rename(columns={col: f"Griffin_Cent_{col}"})
-        cleaned_files_registry["matrix_griffin.csv"] = pd.merge(pd.merge(df_amp, df_mean, on="Sample_ID"), df_cent, on="Sample_ID")
+        cleaned_files_registry[".csv"] = pd.merge(pd.merge(df_amp, df_mean, on="Sample_ID"), df_cent, on="Sample_ID")
     
     aligned_output_paths = []
     os.makedirs("aligned_clean_matrices", exist_ok=True)
@@ -188,10 +172,9 @@ def clean_and_align_all_matrices():
         
         df_mat["Group"] = df_mat["Sample_ID"].map(group_map)
         df_mat["Split"] = df_mat["Sample_ID"].map(split_map)
-        df_mat["Batch"] = df_mat["Sample_ID"].map(batch_map)
         
-        feat_cols = [c for c in df_mat.columns if c not in ["Sample_ID", "Group", "Split", "Batch"]]
-        ordered_cols = ["Sample_ID", "Group", "Split", "Batch"] + feat_cols
+        feat_cols = [c for c in df_mat.columns if c not in ["Sample_ID", "Group", "Split"]]
+        ordered_cols = ["Sample_ID", "Group", "Split"] + feat_cols
         
         df_final = df_mat.set_index("Sample_ID").loc[sample_list].reset_index()[ordered_cols]
         out_p = os.path.join("aligned_clean_matrices", f"aligned_final_selected_{filename}")
@@ -233,10 +216,11 @@ def calculate_metric_ci(y_true, y_pred, y_proba, metric_type="auc"):
 def plot_and_save_visualizations(df_train, chosen_features, y_test, y_proba, y_pred, best_threshold, out_dir, file_name):
     if len(chosen_features) > 0:
         plt.figure(figsize=(11, 7))
-        train_feat = df_train[chosen_features + ["Batch", "Group"]].copy()
+        train_feat = df_train[chosen_features + ["Group"]].copy()
+        
         for col in chosen_features:
-            for b_id, grp in train_feat.groupby("Batch"):
-                train_feat.loc[grp.index, col] = (grp[col] - grp[col].mean()) / (grp[col].std() + 1e-8)
+            train_feat[col] = (train_feat[col] - train_feat[col].mean()) / (train_feat[col].std() + 1e-8)
+            
         train_feat = train_feat.sort_values(by="Group")
         heatmap_data = train_feat[chosen_features].T
         v_min, v_max = np.percentile(heatmap_data.values, [2, 98])
@@ -245,7 +229,7 @@ def plot_and_save_visualizations(df_train, chosen_features, y_test, y_proba, y_p
             heatmap_data, cmap="RdYlBu_r", col_cluster=False, 
             row_cluster=True if len(chosen_features) > 1 else False,
             vmin=v_min, vmax=v_max, xticklabels=False, yticklabels=True,
-            cbar_kws={'label': 'Batch-Corrected Value (Z-score)'}, figsize=(11, 7)
+            cbar_kws={'label': 'Value (Z-score)'}, figsize=(11, 7)
         )
         g.fig.suptitle(f"Selected Top Features Clustering Heatmap: {file_name}", fontsize=13, y=1.02)
         g.savefig(os.path.join(out_dir, "selected_features_expression_heatmap.pdf"))
@@ -266,7 +250,7 @@ def plot_and_save_visualizations(df_train, chosen_features, y_test, y_proba, y_p
     
     idx_closest = np.argmin(np.abs(tpr - sens_v) + np.abs((1 - fpr) - spec_v))
     axes[0, 0].scatter(fpr[idx_closest], tpr[idx_closest], color='#d62728', s=60, zorder=5, 
-                        label=f'Youden Point (Thresh={best_threshold:.3f})')
+                        label=f'95% Sens Point (Thresh={best_threshold:.3f})')
     
     axes[0, 0].set_xlabel('1 - Specificity (FPR)', fontsize=11)
     axes[0, 0].set_ylabel('Sensitivity (TPR)', fontsize=11)
@@ -369,18 +353,17 @@ def run_optuna_for_file(file_path, output_base_dir):
     scale_weight = float(n_normal / n_tumor) if n_tumor > 0 else 1.0
     
     def get_base_pipeline(m_name, scale_pos_weight=1.0):
-        imputer = DataFrameImputer(ignore_cols=['Batch'])
-        batch_corrector = PipelineBatchCorrector(batch_col='Batch')
+        imputer = DataFrameImputer()
         selector = PipelineStrictFeatureSelector(fdr_alpha=0.05, top_n_fallback=100, l1_C=0.5)
         if m_name == "xgboost":
-            return Pipeline([('imputer', imputer), ('batch_corrector', batch_corrector), ('selector', selector), ('clf', XGBClassifier(scale_pos_weight=scale_pos_weight, eval_metric="logloss", verbosity=0, random_state=SEED, n_jobs=1))])
+            return Pipeline([('imputer', imputer), ('selector', selector), ('clf', XGBClassifier(scale_pos_weight=scale_pos_weight, eval_metric="logloss", verbosity=0, random_state=SEED, n_jobs=1))])
         elif m_name == "lightgbm":
-            return Pipeline([('imputer', imputer), ('batch_corrector', batch_corrector), ('selector', selector), ('clf', LGBMClassifier(class_weight='balanced', verbose=-1, random_state=SEED, n_jobs=1))])
+            return Pipeline([('imputer', imputer), ('selector', selector), ('clf', LGBMClassifier(class_weight='balanced', verbose=-1, random_state=SEED, n_jobs=1))])
         elif m_name == "randomforest":
-            return Pipeline([('imputer', imputer), ('batch_corrector', batch_corrector), ('selector', selector), ('clf', RandomForestClassifier(class_weight='balanced', random_state=SEED, n_jobs=1))])
+            return Pipeline([('imputer', imputer), ('selector', selector), ('clf', RandomForestClassifier(class_weight='balanced', random_state=SEED, n_jobs=1))])
         elif m_name == "logistic":
             return Pipeline([
-                ('imputer', imputer), ('batch_corrector', batch_corrector), ('selector', selector), 
+                ('imputer', imputer), ('selector', selector), 
                 ('clf', Pipeline([('scaler', StandardScaler()), ('clf', LogisticRegression(solver="liblinear", class_weight='balanced', random_state=SEED))]))
             ])
             
@@ -422,16 +405,15 @@ def run_optuna_for_file(file_path, output_base_dir):
     y_train_oof_proba = cross_val_predict(final_pipeline, X_train, y_train, cv=cv_threshold, method="predict_proba", n_jobs=-1)[:, 1]
     
     fpr_tr, tpr_tr, th_tr = roc_curve(y_train, y_train_oof_proba)
-    youden_tr = tpr_tr - fpr_tr
-    best_thresh_idx = np.argmax(youden_tr)
-    best_threshold = float(th_tr[best_thresh_idx])
     
-    if best_threshold >= 1.0 or best_threshold <= 0.0 or np.isnan(best_threshold):
+    idx_95 = np.where(tpr_tr >= 0.95)[0]
+    if len(idx_95) > 0:
+        best_threshold = float(th_tr[idx_95[0]])
+    else:
         best_threshold = 0.5
         
-    features_without_batch = [c for c in all_features if c != 'Batch']
     passed_idx = final_pipeline.named_steps['selector'].selected_features_idx_
-    final_chosen_features = [features_without_batch[i] for i in passed_idx]
+    final_chosen_features = [all_features[i] for i in passed_idx]
     
     y_proba = final_pipeline.predict_proba(X_test)[:, 1]
     y_pred = (y_proba >= best_threshold).astype(int)
@@ -444,29 +426,90 @@ def run_optuna_for_file(file_path, output_base_dir):
         "optimized_threshold": best_threshold,
         "models_metrics": all_models_metrics
     }
-    with open(os.path.join(out_dir, "all_models_best_params.json"), "w") as f:
+    with open(os.path.join(out_dir, f"{file_name}_all_models_best_params.json"), "w") as f:
         json.dump(output_config, f, indent=4)
         
-    pd.DataFrame(classification_report(y_test, y_pred, output_dict=True)).to_csv(os.path.join(out_dir, ".csv"))
-    pd.DataFrame(confusion_matrix(y_test, y_pred)).to_csv(os.path.join(out_dir, ".csv"))
+    pd.DataFrame(classification_report(y_test, y_pred, output_dict=True)).to_csv(os.path.join(out_dir, f"{file_name}_classification_report.csv"))
+    pd.DataFrame(confusion_matrix(y_test, y_pred)).to_csv(os.path.join(out_dir, f"{file_name}_confusion_matrix.csv"))
     
     final_pipeline.selected_features_ = final_chosen_features
     final_pipeline.optimized_threshold_ = best_threshold
-    joblib.dump(final_pipeline, os.path.join(out_dir, "global_best_pipeline.pkl"))
+    joblib.dump(final_pipeline, os.path.join(out_dir, f"{file_name}_global_best_pipeline.pkl"))
     
-    return {"file": file_name, "best_model": best_model_name, "valid_auc": best_cv_auc, "test_auc": test_auc}
+    return {
+        "file": file_name, 
+        "best_model": best_model_name, 
+        "valid_auc": best_cv_auc, 
+        "test_auc": test_auc,
+        "y_train_oof_proba": y_train_oof_proba,
+        "y_test_proba": y_proba,
+        "y_train": y_train,
+        "y_test": y_test
+    }
 
 if __name__ == "__main__":
-    OUTPUT_BASE = "."
+    OUTPUT_BASE = "optuna_results_stacking_ensemble"
     os.makedirs(OUTPUT_BASE, exist_ok=True)
     
     aligned_files = clean_and_align_all_matrices()
     all_summary_results = []
     
+    stacking_train_X = pd.DataFrame()
+    stacking_test_X = pd.DataFrame()
+    y_train_true = None
+    y_test_true = None
+    
     for f in aligned_files:
         res = run_optuna_for_file(f, OUTPUT_BASE)
-        all_summary_results.append(res)
+        all_summary_results.append({
+            "file": res["file"],
+            "best_model": res["best_model"],
+            "valid_auc": res["valid_auc"],
+            "test_auc": res["test_auc"]
+        })
+        
+
+        stacking_train_X[res["file"]] = res["y_train_oof_proba"]
+        stacking_test_X[res["file"]] = res["y_test_proba"]
+        y_train_true = res["y_train"]
+        y_test_true = res["y_test"]
         
     if all_summary_results:
         summary_df = pd.DataFrame(all_summary_results)
-        summary_df.to_csv(os.path.join(OUTPUT_BASE, "summary_all_files.csv"), index=False)
+        summary_df.to_csv(os.path.join(OUTPUT_BASE, "Level_1_summary_all_files.csv"), index=False)
+
+        logger.info("Executing Level 2 Stacking Balanced Random Forest Meta-Learner...")
+        
+        meta_learner = RandomForestClassifier(n_estimators=300, class_weight='balanced', random_state=SEED, n_jobs=-1)
+        meta_learner.fit(stacking_train_X, y_train_true)
+        
+
+        meta_train_proba = meta_learner.predict_proba(stacking_train_X)[:, 1]
+        fpr_meta, tpr_meta, th_meta = roc_curve(y_train_true, meta_train_proba)
+        
+        idx_meta_95 = np.where(tpr_meta >= 0.95)[0]
+        final_meta_thresh = float(th_meta[idx_meta_95[0]]) if len(idx_meta_95) > 0 else 0.5
+        
+        meta_test_proba = meta_learner.predict_proba(stacking_test_X)[:, 1]
+        meta_test_pred = (meta_test_proba >= final_meta_thresh).astype(int)
+        
+        stacking_dir = os.path.join(OUTPUT_BASE, "Stacking_MetaLearner_results")
+        os.makedirs(stacking_dir, exist_ok=True)
+        
+        stack_train_vis = stacking_train_X.copy()
+        stack_train_vis["Group"] = ["Tumor" if y == 1 else "Normal" for y in y_train_true]
+        
+        plot_and_save_visualizations(
+            df_train=stack_train_vis, 
+            chosen_features=list(stacking_train_X.columns), 
+            y_test=y_test_true, 
+            y_proba=meta_test_proba, 
+            y_pred=meta_test_pred, 
+            best_threshold=final_meta_thresh, 
+            out_dir=stacking_dir, 
+            file_name="Integrated_Stacking_Meta_Learner"
+        )
+        
+        pd.DataFrame(classification_report(y_test_true, meta_test_pred, output_dict=True)).to_csv(os.path.join(stacking_dir, "meta_classification_report.csv"))
+        pd.DataFrame(confusion_matrix(y_test_true, meta_test_pred)).to_csv(os.path.join(stacking_dir, "meta_confusion_matrix.csv"))
+        joblib.dump(meta_learner, os.path.join(stacking_dir, "stacking_meta_learner.pkl"))
