@@ -1,1 +1,99 @@
 
+cat file.txt |while read sample;
+do
+#Lis's analysis pipeline
+
+#1.filter.
+samtools view -bh -f 2 -F 3844 -q 30 ${sample}.bam > ${sample}_filtered.bam
+samtools index ${sample}_filtered.bam
+
+#2.convert bam files to BEDPE files using bedtools
+samtools sort -n ${sample}_filtered.bam | \
+
+# Convert to BEDPE file
+bedtools bamtobed -i - -bedpe |\
+
+# Calculate insert size and add 'chr' to chromosome field
+awk 'OFS = "\t" {print $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $6-$2}' - >${sample}.bedpe
+
+#3.blacklist region and gap filter.
+hg38="hg38.fa"
+filter="hg38-blacklist.v2.bed"
+
+awk 'OFS = "\t" {print $1, $2, $6, $7, $11}' ${sample}.bedpe |\
+# Sort by chromosome and start position
+sort -k1,1 -k2,2n |\
+# Filter blacklisted/gap regions
+bedtools subtract -a - -b $filter -A |\
+# Obtain fragment GC content 
+bedtools nuc -fi $hg38 -bed - | \
+# Add GC content($7)
+awk 'OFS = "\t" {print $1, $2, $3, $4, $5, $7}' - >${sample}_frags_gc.bed
+
+#4.bin_5MB.
+bins5mb="bins5mb_filtered.bed" 
+
+bedtools intersect -a $bins5mb -b ${sample}_frags_gc.bed -wo |\
+
+# Moved base overlap ($11) to $5 to avoid issues with uniq syntax 
+awk 'OFS="\t" {ov=$11; print $1, $2, $3, $4, ov, $5, $6, $7, $8, $9, $10}' - |\
+
+# Sort by QNAME ($9) and obtain unique fragments 
+sort -k9,9 |\
+uniq -u -f8 |\
+
+# Remove $5 (base pair overlap)
+awk 'OFS="\t" {print $1, $2, $3, $4, $6, $7, $8, $9, $10, $11}' - > tmp_${sample}_uniq.bed 
+
+# Intersect fragments with 5Mb bins and obtain duplicated fragments at bin boundaries
+bedtools intersect -a $bins5mb -b ${sample}_frags_gc.bed -wo |\
+
+# Moved base overlap ($11) to $5 to avoid issues with uniq syntax 
+awk 'OFS="\t" {ov=$11; print $1, $2, $3, $4, ov, $5, $6, $7, $8, $9, $10}' - |\
+sort -k9,9 |\
+# Obtain duplicate fragment based QNAME ($9)
+uniq -D -f8 |\
+# Sort by QNAME and base pair overlap ($5)
+sort -k9,9 -k5,5nr |\
+# Compare base pair overlap of duplicate fragment & filter out fragment with smallest overlap  
+# If tie, will use the first bin
+awk 'BEGIN {
+  FS=OFS="\t"; prev=""; maxval=0} {
+  if ($9==prev) {
+    if ($5>maxval) {maxval=$5; line=$0}
+  } else {
+    if (prev!="") print line; 
+      maxval=$5; line=$0; prev=$9
+  }
+}
+END {if (prev!="") print line}' - |\
+# Remove $5 (base pair overlap)
+awk 'OFS="\t" {print $1, $2, $3, $4, $6, $7, $8, $9, $10, $11}' - > tmp_${sample}_dupl.bed 
+echo "temp_dupl:" tmp_${sample}_dupl.bed 
+
+# Combine unique and de-duplicated fragments
+cat tmp_${sample}_uniq.bed tmp_${sample}_dupl.bed > ${sample}_frags_5mb.bed
+
+# Delete temporary files 
+rm tmp_${sample}_uniq.bed tmp_${sample}_dupl.bed ${sample}_filtered.bam* ${sample}_frags_gc.bed
+
+#5.filter_bedpe.
+awk '
+  BEGIN{
+    # Set the input and output field separators to tab
+    FS=OFS="\t"
+  }
+  FNR==NR{
+    # For the first, create an array with QNAME as the key and GC content as the value
+    arr[$8]=$10
+    # Skip to the next record without executing the rest of the code
+    next
+  }
+  ($7 in arr){
+    # For the second file (BEDPE), if the QNAME exists in the array,
+    # print the current line and append the GC content from the array
+    print $0, arr[$7]
+  }
+' ${sample}_frags_5mb.bed ${sample}.bedpe > ${sample}_filtered.bedpe
+  rm ${sample}.bedpe
+  rm ${sample}_filtered.bedpe
