@@ -1,1 +1,75 @@
 
+#1.CUT&TAG analysis.
+trim_galore -j 15 -q 20 --phred33 --length 25 -e 0.1 --max_n 3 --stringency 3 -o . --paired ${id}_1.fq.gz ${id}_2.fq.gz
+INDEX=
+bowtie2 --very-sensitive-local --no-unal --no-mixed --no-discordant -p 20 -x ${INDEX} --phred33 -I 10 -X 700 \
+-1 ${id}_1_val_1.fq.gz \
+-2 ${id}_2_val_2.fq.gz \
+-S ${id}.sam \
+--un-conc ${id}>${id}.alignment.summary
+java -jar picard.jar MarkDuplicates PG=null \
+VERBOSITY=ERROR \
+QUIET=true \
+CREATE_INDEX=false \
+REMOVE_DUPLICATES=false \
+INPUT=${id}_sort.bam \
+OUTPUT=${id}_dedup.bam \
+METRICS_FILE=${id}_pe.markduplicates.log \
+VALIDATION_STRINGENCY=SILENT
+macs2 callpeak -t ${id}.rmchrM.bam \
+-n ${id} \
+-f BAMPE \
+-g 2913022398 \
+-p 1e-10 \
+--keep-dup all \
+--outdir .
+
+#2.ATAC-seq
+trim_galore -j 20 --phred33 -q 20 --length 8 --max_n 3 --stringency 3 --paired -o . ${id}_1.fq.gz ${id}_2.fq.gz
+bowtie2 -p 40 -x hg38_chr --very-sensitive --no-mixed --no-discordant -X 2000 -1 ${id}_1_val_1.fq.gz \
+ 	-2 ${id}_2_val_2.fq.gz 2>${id}.alignment.summary | samtools view -bS | samtools sort -@ 40 -o ${id}.sorted.bam
+java -jar picard.jar CollectInsertSizeMetrics I=${id}.shift.sorted.bam O=${id}_insert_size_metrics.txt H=${id}_insert_size_histogram.pdf M=0.5
+GSIZE="2913022398"
+bamCoverage -p 40 --outFileFormat bigwig --binSize 50 --normalizeUsing RPKM -b ${id}.shift.sorted.bam --effectiveGenomeSize ${GSIZE} -o ${id}.bw
+
+#3.ChIP-seq
+trim_galore -j 8 --phred33 -q 20 --length 20 --max_n 3 --stringency 3 --paired -o . ${id}_1.fq.gz  ${id}_2.fq.gz
+
+#比对
+index=""
+bowtie2 -p 8 \
+-q \
+-x ${index} \
+-1 ${id}_1_val_1.fq.gz \
+-2 ${id}_2_val_2.fq.gz 2>${id}.alignment.summary | samtools view -F 4 -u - | samtools sort -@ 8 -o ${id}.bam -
+
+samtools view -b -f 2 -q 30 -o ${id}.f2.q30.bam ${id}.bam
+
+java -jar picard.jar MarkDuplicates \
+PG=null \
+VERBOSITY=ERROR \
+QUIET=true \
+CREATE_INDEX=false \
+REMOVE_DUPLICATES=true \
+INPUT=${id}.f2.q30.bam \
+OUTPUT=${id}_dedup.bam \
+M=${id}_pe.markduplicates.log 
+
+samtools view -h ${id}_dedup.bam | grep -v 'MT' | samtools view -bS -o ${id}_final.bam
+
+samtools index ${id}_final.bam
+bamCoverage --bam ${id}_final.bam \
+-o ${id}.bw \
+--binSize 10 \
+--normalizeUsing RPKM \
+--effectiveGenomeSize ${GSIZE}
+
+#callpeaks.
+#Macs2 call peaks
+macs2 callpeak -t ${id}_final.bam \
+-f BAMPE \
+-n ${id} \
+-g ${GSIZE} \
+-q 0.05 \
+--outdir .
+done
