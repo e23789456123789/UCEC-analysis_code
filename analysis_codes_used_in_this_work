@@ -487,3 +487,40 @@ if __name__ == "__main__":
         pd.DataFrame(classification_report(y_test_true, meta_test_pred, output_dict=True)).to_csv(os.path.join(stacking_dir, "meta_classification_report.csv"))
         pd.DataFrame(confusion_matrix(y_test_true, meta_test_pred)).to_csv(os.path.join(stacking_dir, "meta_confusion_matrix.csv"))
         joblib.dump(meta_learner, os.path.join(stacking_dir, "stacking_meta_learner.pkl"))
+
+
+combat-seq:
+def run_optuna_for_file(file_path, output_base_dir):
+
+    all_features = [c for c in df.columns if c not in ["Sample_ID", "Group", "Split", "Batch"]] 
+    
+    train_df = df[df["Split"] == "Train"]
+    test_df = df[df["Split"] == "Test"]
+    
+    features_with_batch = all_features + ["Batch"]
+    X_train = train_df[features_with_batch] 
+    y_train = train_df["Group"].map({"Tumor": 1, "Normal": 0}).values
+    X_test = test_df[features_with_batch]
+    y_test = test_df["Group"].map({"Tumor": 1, "Normal": 0}).values
+    
+    n_normal = np.sum(y_train == 0)
+    n_tumor = np.sum(y_train == 1)
+    scale_weight = float(n_normal / n_tumor) if n_tumor > 0 else 1.0
+    
+    def get_base_pipeline(m_name, scale_pos_weight=1.0):
+
+        combat = SklearnCombatCorrection(batch_col="Batch", method="combat")
+        imputer = DataFrameImputer()
+        selector = PipelineStrictFeatureSelector(fdr_alpha=0.05, top_n_fallback=100, l1_C=0.5)
+        
+        if m_name == "xgboost":
+            return Pipeline([('combat', combat), ('imputer', imputer), ('selector', selector), ('clf', XGBClassifier(scale_pos_weight=scale_pos_weight, eval_metric="logloss", verbosity=0, random_state=SEED, n_jobs=1))])
+        elif m_name == "lightgbm":
+            return Pipeline([('combat', combat), ('imputer', imputer), ('selector', selector), ('clf', LGBMClassifier(class_weight='balanced', verbose=-1, random_state=SEED, n_jobs=1))])
+        elif m_name == "randomforest":
+            return Pipeline([('combat', combat), ('imputer', imputer), ('selector', selector), ('clf', RandomForestClassifier(class_weight='balanced', random_state=SEED, n_jobs=1))])
+        elif m_name == "logistic":
+            return Pipeline([
+                ('combat', combat), ('imputer', imputer), ('selector', selector), 
+                ('clf', Pipeline([('scaler', StandardScaler()), ('clf', LogisticRegression(solver="liblinear", class_weight='balanced', random_state=SEED))]))
+            ])
