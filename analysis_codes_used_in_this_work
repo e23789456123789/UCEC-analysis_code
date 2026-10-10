@@ -1,3 +1,31 @@
+import os
+import json
+import logging
+import warnings
+import random
+import numpy as np
+import pandas as pd
+import joblib
+import optuna
+from optuna.samplers import TPESampler
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy.stats import mannwhitneyu
+from statsmodels.stats.multitest import multipletests
+from statsmodels.stats.proportion import proportion_confint
+from sklearn.base import BaseEstimator, TransformerMixin, clone
+from sklearn.model_selection import (StratifiedKFold, StratifiedGroupKFold, GroupShuffleSplit, 
+                                     cross_val_score, cross_val_predict, train_test_split)
+from sklearn.metrics import (roc_auc_score, classification_report, confusion_matrix,
+                             roc_curve, precision_recall_curve, average_precision_score, f1_score)
+from sklearn.calibration import calibration_curve
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from xgboost import XGBClassifier
+from lightgbm import LGBMClassifier
+from sklearn.ensemble import RandomForestClassifier
+from inmoose.pycombat import Combat, CombatSeq
 
 warnings.filterwarnings('ignore')
 optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -7,11 +35,46 @@ logger = logging.getLogger("VisualizedMultiModalPipeline")
 SEED = 56
 random.seed(SEED)
 np.random.seed(SEED)
-OPTUNA_TRIALS = 30    
+OPTUNA_TRIALS = 30
 
 plt.rcParams['font.sans-serif'] = ['Arial', 'Liberation Sans', 'DejaVu Sans']
 plt.rcParams['axes.unicode_minus'] = False
 plt.style.use('seaborn-v0_8-whitegrid' if 'seaborn-v0_8-whitegrid' in plt.style.available else 'default')
+
+class SklearnCombatCorrection(BaseEstimator, TransformerMixin):
+    def __init__(self, method="combat_seq"):
+        self.method = method
+        self.combat_model = None
+
+    def fit(self, X, y=None):
+        X_df = X if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
+        batches = X_df.iloc[:, -1].values
+        X_data = X_df.iloc[:, :-1]
+        
+        if self.method == "combat_seq":
+            X_data = X_data.fillna(0).round().astype(int)
+            zero_var_cols = X_data.columns[X_data.var() == 0]
+            if len(zero_var_cols) > 0:
+                logger.warning(f"Detected {len(zero_var_cols)} zero-variance features.")
+        else:
+            X_data = X_data.astype(float)
+
+        self.combat_model = CombatSeq() if self.method == "combat_seq" else Combat()
+        self.combat_model.fit(X_data.values.T, batches)
+        return self
+
+    def transform(self, X):
+        X_df = X if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
+        batches = X_df.iloc[:, -1].values
+        X_data = X_df.iloc[:, :-1]
+        
+        if self.method == "combat_seq":
+            X_data = X_data.fillna(0).round().astype(int)
+        else:
+            X_data = X_data.astype(float)
+            
+        X_corr_T = self.combat_model.transform(X_data.values.T, batches)
+        return X_corr_T.T
 
 class DataFrameImputer(BaseEstimator, TransformerMixin):
     def __init__(self):
@@ -30,7 +93,7 @@ class DataFrameImputer(BaseEstimator, TransformerMixin):
         for col, mean_val in self.means_.items():
             if col in X_trans.columns and X_trans[col].isnull().any():
                 X_trans[col] = X_trans[col].fillna(mean_val)
-        return X_trans
+        return X_trans.values if not isinstance(X, pd.DataFrame) else X_trans
 
 class PipelineStrictFeatureSelector(BaseEstimator, TransformerMixin):
     def __init__(self, fdr_alpha=0.05, top_n_fallback=100, l1_C=0.5):
@@ -97,45 +160,39 @@ class PipelineStrictFeatureSelector(BaseEstimator, TransformerMixin):
         return X_arr[:, self.selected_features_idx_]
 
 def clean_and_align_all_matrices():
-    df_ref = pd.read_csv(".csv").drop_duplicates(subset=["Sample_ID"])
+    df_ref = pd.read_csv("phenotype.csv").drop_duplicates(subset=["Sample_ID"])
     core_samples = set(df_ref["Sample_ID"].tolist())
     
     group_map = {}
+    batch_map = {}
+    patient_map = {}
+    
     for _, row in df_ref.iterrows():
         s_id = row["Sample_ID"]
         val_lower = str(row["Sample Type"]).lower().strip()
         group_map[s_id] = "Tumor" if val_lower in ["tumor", "cancer", "case"] else "Normal"
+        batch_map[s_id] = str(row.get("Dataset", "Dataset_1"))
+        patient_map[s_id] = str(row.get("Patient_ID", s_id))
     
     sample_list = sorted(list(core_samples))
     
-    df_samples = pd.DataFrame([{"Sample_ID": s, "Group": group_map[s]} for s in sample_list])
-    train_df, test_df = train_test_split(df_samples, test_size=0.3, stratify=df_samples["Group"], random_state=SEED)
+    df_samples = pd.DataFrame([
+        {"Sample_ID": s, "Group": group_map[s], "Patient_ID": patient_map[s]} 
+        for s in sample_list
+    ])
+    
+    gss = GroupShuffleSplit(n_splits=1, test_size=0.3, random_state=SEED)
+    train_idx, test_idx = next(gss.split(df_samples, df_samples["Group"], groups=df_samples["Patient_ID"]))
+    
+    train_df = df_samples.iloc[train_idx]
+    test_df = df_samples.iloc[test_idx]
     
     split_map = {row["Sample_ID"]: "Train" for _, row in train_df.iterrows()}
     split_map.update({row["Sample_ID"]: "Test" for _, row in test_df.iterrows()})
     
     cleaned_files_registry = {}
-    if os.path.exists(".tsv"):
-        cleaned_files_registry[".csv"] = pd.read_csv(".tsv", sep='\t', index_col=0).T.reset_index().rename(columns={"index": "Sample_ID"})
-    if os.path.exists(".csv"):
-        cleaned_files_registry[".csv"] = pd.read_csv(".csv").rename(columns={"id": "Sample_ID"}).drop(columns=["type"], errors="ignore")
-    if os.path.exists(".csv"):
-        cleaned_files_registry[".csv"] = pd.read_csv(".csv").rename(columns={"WhichSample": "Sample_ID"}).drop(columns=["WhichGroup"], errors="ignore")
-    if os.path.exists(".csv"):
-        cleaned_files_registry[".csv"] = pd.read_csv(".csv").rename(columns={"WhichSample": "Sample_ID"}).drop(columns=["WhichGroup"], errors="ignore")
-    if os.path.exists(".csv"):
-        cleaned_files_registry[".csv"] = pd.read_csv(".csv").drop(columns=["Sample Type"], errors="ignore")
-    if os.path.exists(".csv") and os.path.exists(".csv") and os.path.exists(".csv"):
-        df_amp = pd.read_csv(".csv").rename(columns={"Unnamed: 0": "Sample_ID"}).drop(columns=["Type"], errors="ignore")
-        df_mean = pd.read_csv(".csv").rename(columns={"Unnamed: 0": "Sample_ID"}).drop(columns=["Type"], errors="ignore")
-        df_cent = pd.read_csv(".csv").rename(columns={"Unnamed: 0": "Sample_ID"}).drop(columns=["Type"], errors="ignore")
-        for col in df_amp.columns:
-            if col != "Sample_ID": df_amp = df_amp.rename(columns={col: f"Griffin_Amp_{col}"})
-        for col in df_mean.columns:
-            if col != "Sample_ID": df_mean = df_mean.rename(columns={col: f"Griffin_Mean_{col}"})
-        for col in df_cent.columns:
-            if col != "Sample_ID": df_cent = df_cent.rename(columns={col: f"Griffin_Cent_{col}"})
-        cleaned_files_registry[".csv"] = pd.merge(pd.merge(df_amp, df_mean, on="Sample_ID"), df_cent, on="Sample_ID")
+    if os.path.exists("matrix1.tsv"):
+        cleaned_files_registry["matrix1.csv"] = pd.read_csv("matrix1.tsv", sep='\t', index_col=0).T.reset_index().rename(columns={"index": "Sample_ID"})
     
     aligned_output_paths = []
     os.makedirs("aligned_clean_matrices", exist_ok=True)
@@ -146,9 +203,11 @@ def clean_and_align_all_matrices():
         
         df_mat["Group"] = df_mat["Sample_ID"].map(group_map)
         df_mat["Split"] = df_mat["Sample_ID"].map(split_map)
+        df_mat["Batch"] = df_mat["Sample_ID"].map(batch_map)
+        df_mat["Patient_ID"] = df_mat["Sample_ID"].map(patient_map)
         
-        feat_cols = [c for c in df_mat.columns if c not in ["Sample_ID", "Group", "Split"]]
-        ordered_cols = ["Sample_ID", "Group", "Split"] + feat_cols
+        feat_cols = [c for c in df_mat.columns if c not in ["Sample_ID", "Group", "Split", "Batch", "Patient_ID"]]
+        ordered_cols = ["Sample_ID", "Group", "Split", "Batch", "Patient_ID"] + feat_cols
         
         df_final = df_mat.set_index("Sample_ID").loc[sample_list].reset_index()[ordered_cols]
         out_p = os.path.join("aligned_clean_matrices", f"aligned_final_selected_{filename}")
@@ -312,14 +371,18 @@ def run_optuna_for_file(file_path, output_base_dir):
     out_dir = os.path.join(output_base_dir, f"{file_name}_results")
     os.makedirs(out_dir, exist_ok=True)
     
-    all_features = [c for c in df.columns if c not in ["Sample_ID", "Group", "Split"]]
+    all_features = [c for c in df.columns if c not in ["Sample_ID", "Group", "Split", "Batch", "Patient_ID"]]
     
     train_df = df[df["Split"] == "Train"]
     test_df = df[df["Split"] == "Test"]
     
-    X_train = train_df[all_features]
+    features_with_batch = all_features + ["Batch"]
+    
+    X_train = train_df[features_with_batch].copy()
     y_train = train_df["Group"].map({"Tumor": 1, "Normal": 0}).values
-    X_test = test_df[all_features]
+    groups_train = train_df["Patient_ID"].values
+    
+    X_test = test_df[features_with_batch].copy()
     y_test = test_df["Group"].map({"Tumor": 1, "Normal": 0}).values
     
     n_normal = np.sum(y_train == 0)
@@ -327,17 +390,19 @@ def run_optuna_for_file(file_path, output_base_dir):
     scale_weight = float(n_normal / n_tumor) if n_tumor > 0 else 1.0
     
     def get_base_pipeline(m_name, scale_pos_weight=1.0):
+        combat = SklearnCombatCorrection(method="combat_seq")
         imputer = DataFrameImputer()
         selector = PipelineStrictFeatureSelector(fdr_alpha=0.05, top_n_fallback=100, l1_C=0.5)
+        
         if m_name == "xgboost":
-            return Pipeline([('imputer', imputer), ('selector', selector), ('clf', XGBClassifier(scale_pos_weight=scale_pos_weight, eval_metric="logloss", verbosity=0, random_state=SEED, n_jobs=1))])
+            return Pipeline([('combat', combat), ('imputer', imputer), ('selector', selector), ('clf', XGBClassifier(scale_pos_weight=scale_pos_weight, eval_metric="logloss", verbosity=0, random_state=SEED, n_jobs=1))])
         elif m_name == "lightgbm":
-            return Pipeline([('imputer', imputer), ('selector', selector), ('clf', LGBMClassifier(class_weight='balanced', verbose=-1, random_state=SEED, n_jobs=1))])
+            return Pipeline([('combat', combat), ('imputer', imputer), ('selector', selector), ('clf', LGBMClassifier(class_weight='balanced', verbose=-1, random_state=SEED, n_jobs=1))])
         elif m_name == "randomforest":
-            return Pipeline([('imputer', imputer), ('selector', selector), ('clf', RandomForestClassifier(class_weight='balanced', random_state=SEED, n_jobs=1))])
+            return Pipeline([('combat', combat), ('imputer', imputer), ('selector', selector), ('clf', RandomForestClassifier(class_weight='balanced', random_state=SEED, n_jobs=1))])
         elif m_name == "logistic":
             return Pipeline([
-                ('imputer', imputer), ('selector', selector), 
+                ('combat', combat), ('imputer', imputer), ('selector', selector), 
                 ('clf', Pipeline([('scaler', StandardScaler()), ('clf', LogisticRegression(solver="liblinear", class_weight='balanced', random_state=SEED))]))
             ])
             
@@ -353,8 +418,8 @@ def run_optuna_for_file(file_path, output_base_dir):
             params = create_pipeline_space(model_name, trial)
             pipe = clone(base_pipe)
             pipe.set_params(**params)
-            cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)
-            scores = cross_val_score(pipe, X_train, y_train, scoring="roc_auc", cv=cv, n_jobs=-1)
+            cv = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=SEED)
+            scores = cross_val_score(pipe, X_train, y_train, groups=groups_train, scoring="roc_auc", cv=cv, n_jobs=-1)
             return scores.mean()
             
         study = optuna.create_study(direction="maximize", sampler=TPESampler(seed=SEED))
@@ -375,16 +440,13 @@ def run_optuna_for_file(file_path, output_base_dir):
     final_pipeline.set_params(**best_pipeline_params)
     final_pipeline.fit(X_train, y_train)
     
-    cv_threshold = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)
-    y_train_oof_proba = cross_val_predict(final_pipeline, X_train, y_train, cv=cv_threshold, method="predict_proba", n_jobs=-1)[:, 1]
+    cv_threshold = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=SEED)
+    y_train_oof_proba = cross_val_predict(final_pipeline, X_train, y_train, groups=groups_train, cv=cv_threshold, method="predict_proba", n_jobs=-1)[:, 1]
     
     fpr_tr, tpr_tr, th_tr = roc_curve(y_train, y_train_oof_proba)
     
     idx_95 = np.where(tpr_tr >= 0.95)[0]
-    if len(idx_95) > 0:
-        best_threshold = float(th_tr[idx_95[0]])
-    else:
-        best_threshold = 0.5
+    best_threshold = float(th_tr[idx_95[0]]) if len(idx_95) > 0 else 0.5
         
     passed_idx = final_pipeline.named_steps['selector'].selected_features_idx_
     final_chosen_features = [all_features[i] for i in passed_idx]
@@ -393,7 +455,8 @@ def run_optuna_for_file(file_path, output_base_dir):
     y_pred = (y_proba >= best_threshold).astype(int)
     test_auc = roc_auc_score(y_test, y_proba)
     
-    plot_and_save_visualizations(train_df, final_chosen_features, y_test, y_proba, y_pred, best_threshold, out_dir, file_name)
+    train_clean_df = train_df.copy()
+    plot_and_save_visualizations(train_clean_df, final_chosen_features, y_test, y_proba, y_pred, best_threshold, out_dir, file_name)
     
     output_config = {
         "selected_features": final_chosen_features,
@@ -442,7 +505,6 @@ if __name__ == "__main__":
             "test_auc": res["test_auc"]
         })
         
-
         stacking_train_X[res["file"]] = res["y_train_oof_proba"]
         stacking_test_X[res["file"]] = res["y_test_proba"]
         y_train_true = res["y_train"]
@@ -457,7 +519,6 @@ if __name__ == "__main__":
         meta_learner = RandomForestClassifier(n_estimators=300, class_weight='balanced', random_state=SEED, n_jobs=-1)
         meta_learner.fit(stacking_train_X, y_train_true)
         
-
         meta_train_proba = meta_learner.predict_proba(stacking_train_X)[:, 1]
         fpr_meta, tpr_meta, th_meta = roc_curve(y_train_true, meta_train_proba)
         
@@ -487,40 +548,3 @@ if __name__ == "__main__":
         pd.DataFrame(classification_report(y_test_true, meta_test_pred, output_dict=True)).to_csv(os.path.join(stacking_dir, "meta_classification_report.csv"))
         pd.DataFrame(confusion_matrix(y_test_true, meta_test_pred)).to_csv(os.path.join(stacking_dir, "meta_confusion_matrix.csv"))
         joblib.dump(meta_learner, os.path.join(stacking_dir, "stacking_meta_learner.pkl"))
-
-
-combat-seq:
-def run_optuna_for_file(file_path, output_base_dir):
-
-    all_features = [c for c in df.columns if c not in ["Sample_ID", "Group", "Split", "Batch"]] 
-    
-    train_df = df[df["Split"] == "Train"]
-    test_df = df[df["Split"] == "Test"]
-    
-    features_with_batch = all_features + ["Batch"]
-    X_train = train_df[features_with_batch] 
-    y_train = train_df["Group"].map({"Tumor": 1, "Normal": 0}).values
-    X_test = test_df[features_with_batch]
-    y_test = test_df["Group"].map({"Tumor": 1, "Normal": 0}).values
-    
-    n_normal = np.sum(y_train == 0)
-    n_tumor = np.sum(y_train == 1)
-    scale_weight = float(n_normal / n_tumor) if n_tumor > 0 else 1.0
-    
-    def get_base_pipeline(m_name, scale_pos_weight=1.0):
-
-        combat = SklearnCombatCorrection(batch_col="Batch", method="combat")
-        imputer = DataFrameImputer()
-        selector = PipelineStrictFeatureSelector(fdr_alpha=0.05, top_n_fallback=100, l1_C=0.5)
-        
-        if m_name == "xgboost":
-            return Pipeline([('combat', combat), ('imputer', imputer), ('selector', selector), ('clf', XGBClassifier(scale_pos_weight=scale_pos_weight, eval_metric="logloss", verbosity=0, random_state=SEED, n_jobs=1))])
-        elif m_name == "lightgbm":
-            return Pipeline([('combat', combat), ('imputer', imputer), ('selector', selector), ('clf', LGBMClassifier(class_weight='balanced', verbose=-1, random_state=SEED, n_jobs=1))])
-        elif m_name == "randomforest":
-            return Pipeline([('combat', combat), ('imputer', imputer), ('selector', selector), ('clf', RandomForestClassifier(class_weight='balanced', random_state=SEED, n_jobs=1))])
-        elif m_name == "logistic":
-            return Pipeline([
-                ('combat', combat), ('imputer', imputer), ('selector', selector), 
-                ('clf', Pipeline([('scaler', StandardScaler()), ('clf', LogisticRegression(solver="liblinear", class_weight='balanced', random_state=SEED))]))
-            ])
